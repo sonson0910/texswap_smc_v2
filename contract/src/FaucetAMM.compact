@@ -1,0 +1,302 @@
+pragma language_version >= 0.20;
+
+// FaucetAMM contract using UNSHIELDED tokens with real token transfers
+// Based on midnight-wallet-dapp sendUnshielded/receiveUnshielded pattern
+// Pool holds tokens and sends them to users on swap (not mint new)
+
+import CompactStandardLibrary;
+
+// Swap fee in basis points (e.g. 500 = 5%)
+export ledger feeBps: Uint<16>;
+
+// The fee is only charged on the X side
+export ledger xRewards: Uint<128>;
+
+// Liquidity tracking
+export ledger xLiquidity: Uint<128>;
+
+export ledger yLiquidity: Uint<128>;
+
+export ledger lpCirculatingSupply: Uint<128>;
+
+// Token type (color) storage — set on first mint, used for send/receive
+export ledger xTokenType: Bytes<32>;
+export ledger yTokenType: Bytes<32>;
+export ledger lpTokenType: Bytes<32>;
+
+// Pool counters for tracking
+export ledger poolXBalance: Counter;
+export ledger poolYBalance: Counter;
+
+constructor(
+    f: Uint<16>
+) {
+    // Fee must be less than 100% (10000 basis points)
+    assert(f < 10000, "Fee too high");
+
+    feeBps = disclose(f);
+    xRewards = 0;
+    xLiquidity = 0;
+    yLiquidity = 0;
+    lpCirculatingSupply = 0;
+}
+
+// Helper: check if a Bytes<32> is all zeros
+circuit isZero(a: Bytes<32>): Boolean {
+    return a == pad(32, '');
+}
+
+// ──────────────────────────────────────────────
+// MINT FUNCTIONS — Mint tokens into CONTRACT's own balance (pool)
+// These are faucet mints: contract mints tokens and holds them
+// ──────────────────────────────────────────────
+
+export circuit mintTestTokensX(amount: Uint<64>): Bytes<32> {
+    const domain = getXTokenName();
+    const color = mintUnshieldedToken(
+        disclose(domain),
+        disclose(amount),
+        left<ContractAddress, UserAddress>(kernel.self())
+    );
+    // Contract receives the minted tokens into its own balance
+    receiveUnshielded(color, disclose(amount) as Uint<128>);
+    poolXBalance.increment(disclose(amount) as Uint<16>);
+
+    // Store token type on first mint
+    if (isZero(xTokenType)) {
+        xTokenType = color;
+    }
+    return color;
+}
+
+export circuit mintTestTokensY(amount: Uint<64>): Bytes<32> {
+    const domain = getYTokenName();
+    const color = mintUnshieldedToken(
+        disclose(domain),
+        disclose(amount),
+        left<ContractAddress, UserAddress>(kernel.self())
+    );
+    // Contract receives the minted tokens into its own balance
+    receiveUnshielded(color, disclose(amount) as Uint<128>);
+    poolYBalance.increment(disclose(amount) as Uint<16>);
+
+    // Store token type on first mint
+    if (isZero(yTokenType)) {
+        yTokenType = color;
+    }
+    return color;
+}
+
+// ──────────────────────────────────────────────
+// LIQUIDITY FUNCTIONS
+// initLiquidity: contract already holds minted tokens, just allocate to pool
+// LP tokens are minted and sent to user
+// ──────────────────────────────────────────────
+
+export circuit initLiquidity(
+    xIn: Uint<64>,
+    yIn: Uint<64>,
+    lpOut: Uint<64>,
+    user_addr: UserAddress
+): [] {
+    assert(lpCirculatingSupply == 0, "Already initialized");
+    assert(lpOut*lpOut <= xIn*yIn, "Too many LP tokens taken");
+
+    // No receiveUnshielded here — contract already holds the tokens from mint
+
+    // Mint LP tokens to CONTRACT first, then send to user
+    const lpDomain = getLPTokenName();
+    const lpColor = mintUnshieldedToken(
+        disclose(lpDomain),
+        disclose(lpOut),
+        left<ContractAddress, UserAddress>(kernel.self())
+    );
+    // Store LP token type on first mint
+    if (isZero(lpTokenType)) {
+        lpTokenType = lpColor;
+    }
+    // Receive LP into contract balance, then send to user
+    receiveUnshielded(lpColor, disclose(lpOut) as Uint<128>);
+    sendUnshielded(
+        lpColor,
+        disclose(lpOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Update liquidity state (allocates from contract pool)
+    lpCirculatingSupply = disclose(lpOut);
+    xLiquidity = disclose(xIn);
+    yLiquidity = disclose(yIn);
+}
+
+export circuit addLiquidity(
+    xIn: Uint<64>,
+    yIn: Uint<64>,
+    lpOut: Uint<64>,
+    user_addr: UserAddress
+): [] {
+    assert(lpCirculatingSupply > 0, "Not yet initialized");
+
+    const xLiquidityAdded = disclose(xIn);
+    const yLiquidityAdded = disclose(yIn);
+
+    if (xLiquidityAdded * yLiquidity < yLiquidityAdded * xLiquidity) {
+        const xLhs = lpOut * xLiquidity;
+        const xRhs = xLiquidityAdded * lpCirculatingSupply;
+        assert(xLhs <= xRhs, "Too many LP tokens taken (bound by xIn)");
+    } else {
+        const yLhs = lpOut * yLiquidity;
+        const yRhs = yLiquidityAdded * lpCirculatingSupply;
+        assert(yLhs <= yRhs, "Too many LP tokens taken (bound by yIn)");
+    }
+
+    // Receive X and Y from user into contract
+    receiveUnshielded(xTokenType, disclose(xIn) as Uint<128>);
+    receiveUnshielded(yTokenType, disclose(yIn) as Uint<128>);
+
+    // Mint LP tokens, receive into contract balance, then send to user
+    const lpDomain = getLPTokenName();
+    const lpColor = mintUnshieldedToken(
+        disclose(lpDomain),
+        disclose(lpOut),
+        left<ContractAddress, UserAddress>(kernel.self())
+    );
+    receiveUnshielded(lpColor, disclose(lpOut) as Uint<128>);
+    sendUnshielded(
+        lpColor,
+        disclose(lpOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Update liquidity state
+    lpCirculatingSupply = lpCirculatingSupply + disclose(lpOut) as Uint<128>;
+    xLiquidity = xLiquidity + xLiquidityAdded as Uint<128>;
+    yLiquidity = yLiquidity + yLiquidityAdded as Uint<128>;
+}
+
+export circuit removeLiquidity(
+    lpIn: Uint<64>,
+    xOut: Uint<64>,
+    yOut: Uint<64>,
+    user_addr: UserAddress
+): [] {
+    const xLhs = xOut * lpCirculatingSupply;
+    const xRhs = lpIn * xLiquidity;
+    assert(xLhs <= xRhs, "Too many X tokens taken");
+
+    const yLhs = yOut * lpCirculatingSupply;
+    const yRhs = lpIn * yLiquidity;
+    assert(yLhs <= yRhs, "Too many Y tokens taken");
+
+    // Receive LP from user
+    receiveUnshielded(lpTokenType, disclose(lpIn) as Uint<128>);
+
+    // Send X tokens to user
+    sendUnshielded(
+        xTokenType,
+        disclose(xOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Send Y tokens to user
+    sendUnshielded(
+        yTokenType,
+        disclose(yOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Update state
+    lpCirculatingSupply = lpCirculatingSupply - disclose(lpIn);
+    xLiquidity = xLiquidity - disclose(xOut);
+    yLiquidity = yLiquidity - disclose(yOut);
+}
+
+// ──────────────────────────────────────────────
+// SWAP FUNCTIONS — Contract sends from pool, receives from user
+// receiveUnshielded() takes tokens from user's wallet
+// sendUnshielded() sends tokens from contract's pool to user
+// ──────────────────────────────────────────────
+
+export circuit swapXToY(
+    xIn: Uint<64>,
+    xFee: Uint<64>,
+    yOut: Uint<64>,
+    user_addr: UserAddress
+): [] {
+    // Fee validation: xFee >= xIn * feeBps / 10000 (without division)
+    assert(xFee * 10000 >= xIn * feeBps, "Insufficient fee");
+
+    // Net X added to pool (after fee)
+    const xNet = xIn - xFee;
+
+    // Constant product invariant: K_new >= K_old
+    const oldK = calcK(xLiquidity, yLiquidity);
+    const newK = calcK((xLiquidity + disclose(xNet)) as Uint<128>, (yLiquidity - disclose(yOut)) as Uint<128>);
+    assert(newK >= oldK, "K invariant violated");
+
+    // Contract already holds X tokens from mint — no receiveUnshielded needed
+
+    // Send Y from contract to user
+    sendUnshielded(
+        yTokenType,
+        disclose(yOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Update state
+    xLiquidity = xLiquidity + disclose(xNet) as Uint<128>;
+    yLiquidity = yLiquidity - disclose(yOut);
+    xRewards = xRewards + disclose(xFee) as Uint<128>;
+}
+
+export circuit swapYToX(
+    yIn: Uint<64>,
+    xFee: Uint<64>,
+    xOut: Uint<64>,
+    user_addr: UserAddress
+): [] {
+    // Fee validation
+    assert(xFee * 10000 >= yIn * feeBps, "Insufficient fee");
+
+    // Net Y added to pool (after fee deducted from output)
+    const yNet = yIn - xFee;
+
+    // Constant product invariant: K_new >= K_old
+    const oldK = calcK(xLiquidity, yLiquidity);
+    const newK = calcK((xLiquidity - disclose(xOut)) as Uint<128>, (yLiquidity + disclose(yNet)) as Uint<128>);
+    assert(newK >= oldK, "K invariant violated");
+
+    // Contract already holds Y tokens from mint — no receiveUnshielded needed
+
+    // Send X from contract to user
+    sendUnshielded(
+        xTokenType,
+        disclose(xOut) as Uint<128>,
+        right<ContractAddress, UserAddress>(disclose(user_addr))
+    );
+
+    // Update state
+    yLiquidity = yLiquidity + disclose(yNet) as Uint<128>;
+    xLiquidity = xLiquidity - disclose(xOut);
+    xRewards = xRewards + disclose(xFee) as Uint<128>;
+}
+
+// ──────────────────────────────────────────────
+// TOKEN NAME HELPERS
+// ──────────────────────────────────────────────
+
+circuit getLPTokenName(): Bytes<32> {
+    return pad(32, "Pulse LP Token");
+}
+
+circuit getXTokenName(): Bytes<32> {
+    return pad(32, "Test token X");
+}
+
+circuit getYTokenName(): Bytes<32> {
+    return pad(32, "Test token Y");
+}
+
+circuit calcK(x: Uint<128>, y: Uint<128>): Uint<248> {
+    return ((x as Uint<124>) * (y as Uint<124>)) as Uint<248>;
+}
